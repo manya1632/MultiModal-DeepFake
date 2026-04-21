@@ -12,6 +12,8 @@ import random
 import time
 import datetime
 import json
+import hashlib
+import io
 from pathlib import Path
 
 import torch
@@ -19,6 +21,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
+from torch.cuda.amp import autocast, GradScaler
+from torch.utils.data import Subset
+from PIL import Image as PILImage
 
 from models.vit import interpolate_pos_embed
 from transformers import BertTokenizerFast
@@ -42,6 +47,11 @@ from scipy.interpolate import interp1d
 from models import box_ops
 from tools.multilabel_metrics import AveragePrecisionMeter, get_multi_label
 from models.HAMMER import HAMMER
+from models.watermark_image_encoder import ImageWatermarkEncoder
+from models.watermark_image_decoder import ImageWatermarkDecoder
+from models.watermark_text_encoder import TextWatermarkEncoder
+from models.watermark_text_decoder import TextWatermarkDecoder
+from utils.metrics import compute_psnr, compute_nc
 
 def setlogger(log_file):
     filehandler = logging.FileHandler(log_file)
@@ -96,7 +106,101 @@ def text_input_adjust(text_input, fake_word_pos, device):
     return text_input, fake_token_pos_batch
 
 
-def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config, summary_writer):
+def compute_watermark_bits(text_list: list, device: torch.device) -> torch.Tensor:
+    """Compute 128-bit watermark vectors from SHA256(text) for a batch.
+    Returns (B, 128) float32 tensor with values in {0.0, 1.0}."""
+    bits_list = []
+    for text in text_list:
+        digest = hashlib.sha256(text.encode()).digest()[:16]  # 16 bytes = 128 bits
+        bits = torch.tensor([int(b) for byte in digest for b in format(byte, '08b')], dtype=torch.float32)
+        bits_list.append(bits)
+    return torch.stack(bits_list).to(device)
+
+
+def compute_image_watermark_bits(image_features: torch.Tensor) -> torch.Tensor:
+    """Compute 128-bit watermark vectors from image features hash for a batch.
+    Returns (B, 128) float32 tensor with values in {0.0, 1.0}."""
+    bits_list = []
+    for feat in image_features:
+        feat_bytes = feat.detach().cpu().float().numpy().tobytes()[:16]
+        if len(feat_bytes) < 16:
+            feat_bytes = feat_bytes + b'\x00' * (16 - len(feat_bytes))
+        digest = hashlib.sha256(feat_bytes).digest()[:16]
+        bits = torch.tensor([int(b) for byte in digest for b in format(byte, '08b')], dtype=torch.float32)
+        bits_list.append(bits)
+    return torch.stack(bits_list).to(image_features.device)
+
+
+def apply_noise_augmentation(images: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Apply Gaussian noise and JPEG compression simulation to watermarked images.
+    Gaussian noise: sigma in [0.0, 0.05]. JPEG quality: [70, 95]."""
+    import random as rnd
+    from torchvision import transforms
+
+    # Gaussian noise
+    sigma = rnd.uniform(0.0, 0.05)
+    images = images + sigma * torch.randn_like(images)
+    images = torch.clamp(images, 0.0, 1.0)
+
+    # JPEG compression simulation (applied per-image in batch)
+    quality = rnd.randint(70, 95)
+    to_pil = transforms.ToPILImage()
+    to_tensor = transforms.ToTensor()
+    augmented = []
+    for img in images.cpu():
+        pil_img = to_pil(img.clamp(0, 1))
+        buf = io.BytesIO()
+        pil_img.save(buf, format='JPEG', quality=quality)
+        buf.seek(0)
+        compressed = to_tensor(PILImage.open(buf))
+        augmented.append(compressed)
+    return torch.stack(augmented).to(device)
+
+
+def freeze_encoders(model: torch.nn.Module) -> None:
+    """Freeze visual_encoder and text_encoder weights in HAMMER model.
+    Only fusion layers, classification head, and watermark modules remain trainable.
+    Validates: Requirements 1.4, 1.5"""
+    frozen_count = 0
+    for name, param in model.named_parameters():
+        if 'visual_encoder' in name or 'text_encoder' in name:
+            param.requires_grad = False
+            frozen_count += 1
+    print(f"Frozen {frozen_count} parameters in visual_encoder and text_encoder.")
+
+
+def create_balanced_subset(dataset, subset_size: int):
+    """Create a balanced subset with equal real and fake samples.
+    Returns a torch.utils.data.Subset of size min(subset_size, 2*min(n_real, n_fake)).
+    Validates: Requirements 1.1"""
+    real_indices = []
+    fake_indices = []
+
+    for idx in range(len(dataset)):
+        try:
+            sample = dataset[idx]
+            label = sample[1]  # label is second element
+            if label == 'orig':
+                real_indices.append(idx)
+            else:
+                fake_indices.append(idx)
+        except Exception:
+            continue
+
+    n_per_class = min(len(real_indices), len(fake_indices), subset_size // 2)
+
+    rng = np.random.default_rng(42)
+    selected_real = rng.choice(real_indices, size=n_per_class, replace=False).tolist()
+    selected_fake = rng.choice(fake_indices, size=n_per_class, replace=False).tolist()
+
+    selected_indices = selected_real + selected_fake
+    rng.shuffle(selected_indices)
+
+    print(f"Balanced subset: {n_per_class} real + {n_per_class} fake = {len(selected_indices)} total")
+    return Subset(dataset, selected_indices)
+
+
+def train(args, model, wm_img_enc, wm_img_dec, wm_txt_enc, wm_txt_dec, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config, summary_writer, scaler=None):
     # train
     model.train()  
     
@@ -109,6 +213,9 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
     metric_logger.add_meter('loss_TMG', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('loss_MLC', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('loss_watermark', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('psnr', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('nc', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     
     header = 'Train Epoch: [{}]'.format(epoch)
     print_freq = 100   
@@ -138,17 +245,74 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
         else:
             alpha = config['alpha']*min(1,i/len(data_loader)) 
         
-        loss_MAC, loss_BIC, loss_bbox, loss_giou, loss_TMG, loss_MLC = model(image, label, text_input, fake_image_box, fake_token_pos, alpha = alpha)  
-            
-        loss = config['loss_MAC_wgt']*loss_MAC \
-             + config['loss_BIC_wgt']*loss_BIC \
-             + config['loss_bbox_wgt']*loss_bbox \
-             + config['loss_giou_wgt']*loss_giou \
-             + config['loss_TMG_wgt']*loss_TMG \
-             + config['loss_MLC_wgt']*loss_MLC \
-          
-        loss.backward()
-        optimizer.step()    
+        use_fp16 = config.get('use_fp16', False) and scaler is not None
+
+        with autocast(enabled=use_fp16):
+            # --- Watermark step ---
+            m_T = compute_watermark_bits(text, device)  # (B, 128) from SHA256(text)
+
+            # Get image features for image watermark bits (use raw image as proxy)
+            m_I = compute_image_watermark_bits(image.mean(dim=[2, 3]))  # (B, 128)
+
+            # Embed watermarks
+            I_w = wm_img_enc(image, m_T)                    # (B, 3, 224, 224)
+
+            # Get text embeddings from BERT for text watermarking
+            with torch.no_grad():
+                text_embeds = model.module.text_encoder.embeddings(
+                    input_ids=text_input.input_ids
+                ) if args.distributed else model.text_encoder.embeddings(
+                    input_ids=text_input.input_ids
+                )
+            E_w = wm_txt_enc(text_embeds, m_I)              # (B, seq_len, 768)
+
+            # Apply noise augmentation to watermarked images
+            I_w_aug = apply_noise_augmentation(I_w.detach(), device)
+
+            # Decode watermarks
+            m_T_hat = wm_img_dec(I_w_aug)                   # (B, 128)
+            m_I_hat = wm_txt_dec(E_w)                       # (B, 128)
+
+            # Watermark losses
+            mse_loss = torch.nn.functional.mse_loss(I_w, image)
+            bce_img = torch.nn.functional.binary_cross_entropy(m_T_hat, m_T)
+            L_image = mse_loss + bce_img
+
+            cos_sim = torch.nn.functional.cosine_similarity(
+                text_embeds.view(text_embeds.size(0), -1),
+                E_w.view(E_w.size(0), -1), dim=1
+            ).mean()
+            bce_txt = torch.nn.functional.binary_cross_entropy(m_I_hat, m_I)
+            L_text = (1.0 - cos_sim) + bce_txt
+
+            L_watermark = config.get('loss_watermark_wgt', 1.0) * (L_image + L_text)
+
+            # --- HAMMER classification step (with watermarked inputs) ---
+            loss_MAC, loss_BIC, loss_bbox, loss_giou, loss_TMG, loss_MLC = model(I_w, label, text_input, fake_image_box, fake_token_pos, alpha=alpha)
+
+            L_classification = (config['loss_MAC_wgt'] * loss_MAC
+                              + config['loss_BIC_wgt'] * loss_BIC
+                              + config['loss_bbox_wgt'] * loss_bbox
+                              + config['loss_giou_wgt'] * loss_giou
+                              + config['loss_TMG_wgt'] * loss_TMG
+                              + config['loss_MLC_wgt'] * loss_MLC)
+
+            loss = L_watermark + L_classification
+
+        if use_fp16:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            if scaler._scale < 1.0:
+                print(f"[FP16] GradScaler skipped step at epoch {epoch}, iter {i} due to overflow.")
+        else:
+            loss.backward()
+            optimizer.step()
+
+        # Compute PSNR and NC metrics (detached, no grad)
+        with torch.no_grad():
+            psnr_val = compute_psnr(image.float(), I_w.float())
+            nc_val = compute_nc(m_T.float(), (m_T_hat > 0.5).float())
         
         metric_logger.update(loss_MAC=loss_MAC.item())
         metric_logger.update(loss_BIC=loss_BIC.item())
@@ -157,7 +321,10 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
         metric_logger.update(loss_TMG=loss_TMG.item())
         metric_logger.update(loss_MLC=loss_MLC.item())
         metric_logger.update(loss=loss.item())
-        metric_logger.update(lr=optimizer.param_groups[0]["lr"])         
+        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+        metric_logger.update(loss_watermark=L_watermark.item())
+        metric_logger.update(psnr=psnr_val if psnr_val != float('inf') else 100.0)
+        metric_logger.update(nc=nc_val)
         
         if epoch==0 and i%step_size==0 and i<=warmup_iterations and config['schedular']['sched'] != 'cosine_in_step': 
             scheduler.step(i//step_size)   
@@ -175,7 +342,10 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
                 'loss_giou': loss_giou.item(),                                                                                                  
                 'loss_TMG': loss_TMG.item(),                                                                                                  
                 'loss_MLC': loss_MLC.item(),                                                                                                  
-                'loss': loss.item(),                                                                                                  
+                'loss': loss.item(),
+                'loss_watermark': L_watermark.item(),
+                'psnr': psnr_val if psnr_val != float('inf') else 100.0,
+                'nc': nc_val,
                     } 
             for tag, value in lossinfo.items():
                 summary_writer.add_scalar(tag, value, global_step)
@@ -353,6 +523,11 @@ def main_worker(gpu, args, config):
     if args.log:
         print("Creating dataset")
     train_dataset, val_dataset = create_dataset(config)
+
+    if config.get('subset_size'):
+        if args.log:
+            print(f"Creating balanced subset of size {config['subset_size']}")
+        train_dataset = create_balanced_subset(train_dataset, config['subset_size'])
     
     if args.distributed:
         samplers = create_sampler([train_dataset], [True], args.world_size, args.rank) + [None]    
@@ -372,10 +547,31 @@ def main_worker(gpu, args, config):
     if args.log:
         print(f"Creating MAMMER")
     model = HAMMER(args=args, config=config, text_encoder=args.text_encoder, tokenizer=tokenizer, init_deit=True)
-    model = model.to(device)   
-        
+    model = model.to(device)
+
+    # --- Watermark modules ---
+    wm_img_enc = ImageWatermarkEncoder(watermark_dim=config.get('watermark_dim', 128),
+                                        alpha=config.get('watermark_alpha', 0.03)).to(device)
+    wm_img_dec = ImageWatermarkDecoder().to(device)
+    wm_txt_enc = TextWatermarkEncoder(hidden_dim=768,
+                                       watermark_dim=config.get('watermark_dim', 128),
+                                       alpha=config.get('watermark_alpha', 0.03)).to(device)
+    wm_txt_dec = TextWatermarkDecoder(hidden_dim=768,
+                                       watermark_dim=config.get('watermark_dim', 128)).to(device)
+
+    # Freeze encoders if configured
+    if config.get('freeze_encoders', False):
+        freeze_encoders(model)
+
+    # FP16 scaler
+    scaler = GradScaler() if config.get('use_fp16', False) else None
+
     arg_opt = utils.AttrDict(config['optimizer'])
     optimizer = create_optimizer(arg_opt, model)
+    # Add watermark module parameters to optimizer
+    wm_params = (list(wm_img_enc.parameters()) + list(wm_img_dec.parameters()) +
+                 list(wm_txt_enc.parameters()) + list(wm_txt_dec.parameters()))
+    optimizer.add_param_group({'params': wm_params, 'lr': config['optimizer']['lr']})
     arg_sche = utils.AttrDict(config['schedular'])
     lr_scheduler, _ = create_scheduler(arg_sche, optimizer)
     if config['schedular']['sched'] == 'cosine_in_step':
@@ -409,7 +605,7 @@ def main_worker(gpu, args, config):
 
     for epoch in range(start_epoch, max_epoch):
             
-        train_stats = train(args, model, train_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler, config, summary_writer) 
+        train_stats = train(args, model, wm_img_enc, wm_img_dec, wm_txt_enc, wm_txt_dec, train_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler, config, summary_writer, scaler=scaler) 
         AUC_cls, ACC_cls, EER_cls, \
         MAP, OP, OR, OF1, CP, CR, CF1, OP_k, OR_k, OF1_k, CP_k, CR_k, CF1_k, \
         IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \

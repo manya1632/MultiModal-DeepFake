@@ -45,6 +45,104 @@ from tools.multilabel_metrics import AveragePrecisionMeter, get_multi_label
 
 from models.HAMMER import HAMMER
 
+import hashlib
+from dataclasses import dataclass
+from typing import Literal, Optional
+from models.watermark_image_decoder import ImageWatermarkDecoder
+from models.watermark_text_decoder import TextWatermarkDecoder
+from utils.metrics import compute_nc
+from integrity.model_integrity import verify_model, ModelIntegrityError
+
+@dataclass
+class DetectionResult:
+    """Output of the inference pipeline for a single sample."""
+    label: Literal["real", "fake"]
+    trust_score: float          # 0.7 * hammer_score + 0.3 * watermark_score
+    hammer_score: float         # P(fake) from HAMMER BIC head
+    watermark_score: float      # mean NC of extracted watermarks (0.0 if invalid)
+    watermark_valid: bool       # watermark_score >= 0.5
+    bbox: Optional[list]        # [cx, cy, w, h] normalized, or None
+    fake_token_positions: list  # token indices predicted as fake
+
+
+def compute_trust_score(hammer_score: float, watermark_score: float) -> float:
+    """Compute final trust score: 0.7 * hammer_score + 0.3 * watermark_score.
+    Validates: Requirements 10.4"""
+    return 0.7 * hammer_score + 0.3 * watermark_score
+
+
+def extract_watermark_score(
+    image: torch.Tensor,
+    text_embeddings: torch.Tensor,
+    wm_img_dec: ImageWatermarkDecoder,
+    wm_txt_dec: TextWatermarkDecoder,
+    expected_m_T: torch.Tensor,
+    expected_m_I: torch.Tensor,
+    device: torch.device,
+) -> tuple:
+    """Extract watermarks and compute consistency score.
+    Returns (watermark_score, watermark_valid).
+    On any error, returns (0.0, False) without raising.
+    Validates: Requirements 6.1, 6.2, 6.3, 10.6"""
+    try:
+        if image is None or text_embeddings is None:
+            return 0.0, False
+        if image.ndim != 4 or image.shape[1] != 3:
+            return 0.0, False
+        if text_embeddings.ndim != 3:
+            return 0.0, False
+        if torch.isnan(image).any() or torch.isnan(text_embeddings).any():
+            return 0.0, False
+
+        with torch.no_grad():
+            m_T_hat = wm_img_dec(image)           # (B, 128)
+            m_I_hat = wm_txt_dec(text_embeddings)  # (B, 128)
+
+        # Compute NC for each sample and average
+        nc_img = compute_nc(expected_m_T.float(), (m_T_hat > 0.5).float())
+        nc_txt = compute_nc(expected_m_I.float(), (m_I_hat > 0.5).float())
+        watermark_score = float((nc_img + nc_txt) / 2.0)
+        watermark_valid = watermark_score >= 0.5
+        return watermark_score, watermark_valid
+    except Exception:
+        return 0.0, False
+
+
+def load_watermark_models(
+    img_dec_path: Optional[str],
+    txt_dec_path: Optional[str],
+    hash_file: Optional[str],
+    device: torch.device,
+) -> tuple:
+    """Load watermark decoder models with optional integrity verification.
+    Returns (None, None) if paths are not provided."""
+    import json as _json
+
+    hashes = {}
+    if hash_file and os.path.exists(hash_file):
+        with open(hash_file) as f:
+            hashes = _json.load(f)
+
+    wm_img_dec = None
+    wm_txt_dec = None
+
+    if img_dec_path and os.path.exists(img_dec_path):
+        if 'wm_img_dec' in hashes:
+            verify_model(img_dec_path, hashes['wm_img_dec'])
+        wm_img_dec = ImageWatermarkDecoder().to(device)
+        wm_img_dec.load_state_dict(torch.load(img_dec_path, map_location=device))
+        wm_img_dec.eval()
+
+    if txt_dec_path and os.path.exists(txt_dec_path):
+        if 'wm_txt_dec' in hashes:
+            verify_model(txt_dec_path, hashes['wm_txt_dec'])
+        wm_txt_dec = TextWatermarkDecoder().to(device)
+        wm_txt_dec.load_state_dict(torch.load(txt_dec_path, map_location=device))
+        wm_txt_dec.eval()
+
+    return wm_img_dec, wm_txt_dec
+
+
 def setlogger(log_file):
     filehandler = logging.FileHandler(log_file)
     streamhandler = logging.StreamHandler()
@@ -294,6 +392,14 @@ def main_worker(gpu, args, config):
     if args.log:
         print(msg)  
 
+    # Load watermark decoders (optional — graceful fallback if not available)
+    wm_img_dec, wm_txt_dec = load_watermark_models(
+        img_dec_path=getattr(args, 'wm_img_dec', None),
+        txt_dec_path=getattr(args, 'wm_txt_dec', None),
+        hash_file=getattr(args, 'hash_file', None),
+        device=device,
+    )
+
     #### Dataset #### 
     if args.log:
         print("Creating dataset")
@@ -324,6 +430,15 @@ def main_worker(gpu, args, config):
     MAP, OP, OR, OF1, CP, CR, CF1, F1_multicls, \
     IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \
     ACC_tok, Precision_tok, Recall_tok, F1_tok  = evaluation(args, model_without_ddp, val_loader, tokenizer, device, config)
+
+    # Log watermark decoder availability
+    if args.log:
+        wm_available = wm_img_dec is not None and wm_txt_dec is not None
+        logger.info(f"Watermark decoders available: {wm_available}")
+        if wm_available:
+            logger.info("Trust score = 0.7 * hammer_score + 0.3 * watermark_score")
+        else:
+            logger.info("Watermark decoders not loaded — trust score = hammer_score only")
     #============ evaluation info ============#
     val_stats = {"AUC_cls": "{:.4f}".format(AUC_cls*100),
                     "ACC_cls": "{:.4f}".format(ACC_cls*100),
@@ -383,6 +498,9 @@ if __name__ == '__main__':
     parser.add_argument('--model_save_epoch', type=int, default=5)
     parser.add_argument('--token_momentum', default=False, action='store_true')
     parser.add_argument('--test_epoch', default='best', type=str)
+    parser.add_argument('--wm_img_dec', default='', type=str, help='Path to image watermark decoder weights')
+    parser.add_argument('--wm_txt_dec', default='', type=str, help='Path to text watermark decoder weights')
+    parser.add_argument('--hash_file', default='model_hashes.json', type=str, help='Path to model integrity hash file')
 
     args = parser.parse_args()
 
