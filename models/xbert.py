@@ -49,10 +49,31 @@ from transformers.modeling_outputs import (
 )
 from transformers.modeling_utils import (
     PreTrainedModel,
-    apply_chunking_to_forward,
     find_pruneable_heads_and_indices,
     prune_linear_layer,
 )
+
+# apply_chunking_to_forward moved to transformers.pytorch_utils in newer versions
+try:
+    from transformers.modeling_utils import apply_chunking_to_forward
+except ImportError:
+    try:
+        from transformers.pytorch_utils import apply_chunking_to_forward
+    except ImportError:
+        # Fallback: inline implementation for full compatibility
+        def apply_chunking_to_forward(forward_fn, chunk_size, chunk_dim, *input_tensors):
+            if chunk_size > 0:
+                tensor_shape = input_tensors[0].shape[chunk_dim]
+                assert all(t.shape[chunk_dim] == tensor_shape for t in input_tensors)
+                if tensor_shape % chunk_size != 0:
+                    raise ValueError(
+                        f"The dimension to be chunked {tensor_shape} has to be a multiple of chunk_size {chunk_size}"
+                    )
+                num_chunks = tensor_shape // chunk_size
+                input_tensors_chunks = tuple(t.chunk(num_chunks, dim=chunk_dim) for t in input_tensors)
+                output_chunks = tuple(forward_fn(*chunks) for chunks in zip(*input_tensors_chunks))
+                return torch.cat(output_chunks, dim=chunk_dim)
+            return forward_fn(*input_tensors)
 from transformers.utils import logging
 from transformers.models.bert.configuration_bert import BertConfig
 
