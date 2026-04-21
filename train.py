@@ -203,8 +203,8 @@ def create_balanced_subset(dataset, subset_size: int):
 
 def train(args, model, wm_img_enc, wm_img_dec, wm_txt_enc, wm_txt_dec, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config, summary_writer, scaler=None):
     # train
-    model.train()  
-    
+    model.train()
+
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=50, fmt='{value:.6f}'))
     metric_logger.add_meter('loss_MAC', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
@@ -217,18 +217,20 @@ def train(args, model, wm_img_enc, wm_img_dec, wm_txt_enc, wm_txt_dec, data_load
     metric_logger.add_meter('loss_watermark', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('psnr', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('nc', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    
+
     header = 'Train Epoch: [{}]'.format(epoch)
-    print_freq = 100   
+    # FIX 5: lower print_freq so output appears frequently on Kaggle
+    print_freq = 10
     step_size = 100
-    warmup_iterations = warmup_steps*step_size  
+    warmup_iterations = warmup_steps * step_size
 
-    global_step = epoch*len(data_loader)
-    
-    if args.distributed:
-        data_loader.sampler.set_epoch(epoch)
+    global_step = epoch * len(data_loader)
 
-    for i, (image, label, text, fake_image_box, fake_word_pos, W, H) in enumerate(metric_logger.log_every(args, data_loader, print_freq, header)):
+    # FIX 4: removed distributed sampler set_epoch — not needed for single-GPU
+
+    print(f"🔥 Entering training loop... (epoch {epoch}, {len(data_loader)} batches)")
+
+    for i, (image, label, text, fake_image_box, fake_word_pos, W, H) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
 
         if config['schedular']['sched'] == 'cosine_in_step':
             scheduler.adjust_learning_rate(optimizer, i / len(data_loader) + epoch, args, config)        
@@ -260,9 +262,8 @@ def train(args, model, wm_img_enc, wm_img_dec, wm_txt_enc, wm_txt_dec, data_load
 
             # Get text embeddings from BERT for text watermarking
             with torch.no_grad():
-                text_embeds = model.module.text_encoder.embeddings(
-                    input_ids=text_input.input_ids
-                ) if args.distributed else model.text_encoder.embeddings(
+                # Single-GPU: always use model directly (no .module wrapper)
+                text_embeds = model.text_encoder.embeddings(
                     input_ids=text_input.input_ids
                 )
             E_w = wm_txt_enc(text_embeds, m_I)              # (B, seq_len, 768)
@@ -314,6 +315,13 @@ def train(args, model, wm_img_enc, wm_img_dec, wm_txt_enc, wm_txt_dec, data_load
         with torch.no_grad():
             psnr_val = compute_psnr(image.float(), I_w.float())
             nc_val = compute_nc(m_T.float(), (m_T_hat > 0.5).float())
+
+        # FIX 6: debug print every 10 iters so Kaggle shows progress
+        if i % 10 == 0:
+            print(f"  Epoch {epoch}, Iter {i}/{len(data_loader)}, "
+                  f"Loss {loss.item():.4f}, WM {L_watermark.item():.4f}, "
+                  f"PSNR {psnr_val if psnr_val != float('inf') else 100.0:.1f}, NC {nc_val:.3f}",
+                  flush=True)
         
         metric_logger.update(loss_MAC=loss_MAC.item())
         metric_logger.update(loss_BIC=loss_BIC.item())
@@ -383,7 +391,7 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
     multi_label_meter = AveragePrecisionMeter(difficult_examples=False)
     multi_label_meter.reset()
 
-    for i, (image, label, text, fake_image_box, fake_word_pos, W, H) in enumerate(metric_logger.log_every(args, data_loader, print_freq, header)):
+    for i, (image, label, text, fake_image_box, fake_word_pos, W, H) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         
         image = image.to(device,non_blocking=True) 
         
@@ -484,14 +492,14 @@ def main_worker(gpu, args, config):
     if gpu is not None:
         args.gpu = gpu
 
-    init_dist(args)
+    # FIX 3: removed init_dist — not needed for single-GPU Kaggle training
 
-    log_dir = os.path.join(args.output_dir, 'log'+ args.log_num)
+    log_dir = os.path.join(args.output_dir, 'log' + args.log_num)
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, 'shell.txt')
     logger = setlogger(log_file)
-    yaml.dump(config, open(os.path.join(log_dir, 'config.yaml'), 'w')) 
-    
+    yaml.dump(config, open(os.path.join(log_dir, 'config.yaml'), 'w'))
+
     if args.log:
         summary_writer = SummaryWriter(log_dir)
     else:
@@ -504,8 +512,12 @@ def main_worker(gpu, args, config):
         logger.info(config)
         logger.info('******************************')
 
-    
-    device = torch.device(args.device)
+    # FIX 1: device setup inside main_worker with proper indentation
+    print("CUDA available:", torch.cuda.is_available())
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("🚀 Using device:", device)
+
+    print("🔥 Starting training setup...")
 
     # fix the seed for reproducibility
     seed = args.seed + utils.get_rank()
@@ -703,8 +715,8 @@ def main_worker(gpu, args, config):
                 best_epoch = epoch 
 
         if config['schedular']['sched'] != 'cosine_in_step':
-            lr_scheduler.step(epoch+warmup_steps+1)  
-        dist.barrier() 
+            lr_scheduler.step(epoch+warmup_steps+1)
+        # FIX 8: removed dist.barrier() — hangs on single-GPU, not needed
 
     if utils.is_main_process():
         torch.save(save_obj, os.path.join(log_dir, 'checkpoint_%02d.pth'%epoch))   
