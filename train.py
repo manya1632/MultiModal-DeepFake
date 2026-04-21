@@ -737,7 +737,8 @@ if __name__ == '__main__':
     parser.add_argument('--text_encoder', default='bert-base-uncased')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--seed', default=777, type=int)
-    parser.add_argument('--distributed', default=True, type=bool)
+    # FIX 2: default distributed=False for single-GPU Kaggle
+    parser.add_argument('--distributed', default=False, type=bool)
     parser.add_argument('--rank', default=-1, type=int,
                         help='node rank for distributed training')
     parser.add_argument('--world_size', default=1, type=int,
@@ -758,11 +759,5 @@ if __name__ == '__main__':
     with open(args.config, 'r') as f:
         config = yaml.load(f)
 
-    # main(args, config)
-    if args.launcher == 'none':
-        args.launcher = 'pytorch'
-        main_worker(0, args, config)
-    else:
-        ngpus_per_node = torch.cuda.device_count()
-        args.ngpus_per_node = ngpus_per_node
-        mp.spawn(main_worker, nprocs=ngpus_per_node, args=(args, config))
+    # FIX 2: always call main_worker directly — no mp.spawn for single-GPU
+    main_worker(0, args, config)
