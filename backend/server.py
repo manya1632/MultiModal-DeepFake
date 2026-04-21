@@ -162,7 +162,8 @@ async def startup_event() -> None:
 def _load_hammer() -> None:
     global _hammer, _tokenizer
     import argparse
-    import ruamel.yaml as yaml
+    from ruamel.yaml import YAML
+    yaml = YAML()
     from transformers import BertTokenizer
     from models.HAMMER import HAMMER
 
