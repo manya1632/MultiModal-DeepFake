@@ -505,6 +505,8 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    config = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
+    # config = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
+    with open(args.config, 'r') as f:
+    config = yaml.load(f)
  
     main_worker(0, args, config)

@@ -742,7 +742,8 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    config = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
+    with open(args.config, 'r') as f:
+    config = yaml.load(f)
 
     # main(args, config)
     if args.launcher == 'none':
