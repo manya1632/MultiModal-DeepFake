@@ -739,11 +739,12 @@ if __name__ == '__main__':
     parser.add_argument('--log_num', '-l', type=str)
     parser.add_argument('--model_save_epoch', type=int, default=20)
     parser.add_argument('--token_momentum', default=False, action='store_true')
+    parser.add_argument('--log', default=False, action='store_true')
 
     args = parser.parse_args()
 
     with open(args.config, 'r') as f:
-    config = yaml.load(f)
+        config = yaml.load(f)
 
     # main(args, config)
     if args.launcher == 'none':

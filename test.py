@@ -498,6 +498,7 @@ if __name__ == '__main__':
     parser.add_argument('--log_num', '-l', type=str)
     parser.add_argument('--model_save_epoch', type=int, default=5)
     parser.add_argument('--token_momentum', default=False, action='store_true')
+    parser.add_argument('--log', default=False, action='store_true')
     parser.add_argument('--test_epoch', default='best', type=str)
     parser.add_argument('--wm_img_dec', default='', type=str, help='Path to image watermark decoder weights')
     parser.add_argument('--wm_txt_dec', default='', type=str, help='Path to text watermark decoder weights')
@@ -507,6 +508,6 @@ if __name__ == '__main__':
 
     # config = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
     with open(args.config, 'r') as f:
-    config = yaml.load(f)
+        config = yaml.load(f)
  
     main_worker(0, args, config)

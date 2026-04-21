@@ -163,7 +163,7 @@ def _load_hammer() -> None:
     global _hammer, _tokenizer
     import argparse
     from ruamel.yaml import YAML
-    yaml = YAML()
+    _yaml = YAML()
     from transformers import BertTokenizer
     from models.HAMMER import HAMMER
 
@@ -171,7 +171,7 @@ def _load_hammer() -> None:
     config = {}
     if os.path.exists(config_path):
         with open(config_path) as f:
-            config = yaml.YAML().load(f)
+            config = _yaml.load(f)
 
     args = argparse.Namespace(token_momentum=config.get("token_momentum", False))
     tokenizer_name = config.get("text_encoder", "bert-base-uncased")
