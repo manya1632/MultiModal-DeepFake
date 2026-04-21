@@ -6,7 +6,11 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import argparse
-import ruamel_yaml as yaml
+try:
+    import ruamel_yaml as yaml
+except ImportError:
+    from ruamel.yaml import YAML
+    yaml = YAML()
 import numpy as np
 import random
 import time
