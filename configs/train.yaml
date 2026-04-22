@@ -1,5 +1,8 @@
-train_file: ["../../datasets/DGM4/metadata/train.json"]
-val_file: ["../../datasets/DGM4/metadata/val.json"]           
+# train_file: ["../../datasets/DGM4/metadata/train.json"]
+# val_file: ["../../datasets/DGM4/metadata/val.json"]      
+
+train_file: ['/kaggle/working/datasets/DGM4/metadata/train.json']
+val_file: ['/kaggle/working/datasets/DGM4/metadata/val.json']
 bert_config: 'configs/config_bert.json'
 
 # Lightweight training: image size reduced to 224 for T4 GPU compatibility
